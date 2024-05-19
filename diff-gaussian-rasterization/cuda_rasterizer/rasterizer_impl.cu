@@ -162,6 +162,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
+	obtain(chunk, geom.sigmoid_thres_temp, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
@@ -208,6 +209,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* colors_precomp,
 	const float* flows_precomp,
 	const float* opacities,
+	const float* sigmoid_thres,
+	const float* sigmoid_temp,
 	const float* ts,
 	const float* scales,
 	const float* scales_t,
@@ -223,6 +226,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool rot_4d, const int gaussian_dim, const bool force_sh_3d,
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
+	 const float rect_factor,
+    const float alpha_thres,
+	const int bounding_mode,
 	float* out_color,
 	float* out_flow,
 	float* out_depth,
@@ -266,6 +272,8 @@ int CudaRasterizer::Rasterizer::forward(
 		(glm::vec4*)rotations,
 		(glm::vec4*)rotations_r,
 		opacities,
+		sigmoid_thres,
+		sigmoid_temp,
 		shs,
 		geomState.clamped,
 		cov3D_precomp,
@@ -284,9 +292,13 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.cov3D,
 		geomState.rgb,
 		geomState.conic_opacity,
+		geomState.sigmoid_thres_temp,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		rect_factor,
+		alpha_thres,
+		bounding_mode
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
@@ -343,11 +355,14 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		alpha_thres,
+		bounding_mode,
 		geomState.means2D,
 		feature_ptr,
 		flow_ptr,
 		geomState.depths,
 		geomState.conic_opacity,
+		geomState.sigmoid_thres_temp,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
@@ -395,6 +410,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
+	float* dL_sigmoid_thres,
+	float* dL_sigmoid_temp,
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
@@ -405,6 +422,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dscale_t,
 	float* dL_drot,
 	float* dL_drot_r,
+	const float alpha_thres,
+	const int bounding_mode,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -433,9 +452,12 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		alpha_thres,
+		bounding_mode,
 		background,
 		geomState.means2D,
 		geomState.conic_opacity,
+		geomState.sigmoid_thres_temp,
 		color_ptr,
 		depth_ptr,
 		flows_2d,
@@ -448,6 +470,8 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
+		dL_sigmoid_thres,
+		dL_sigmoid_temp,
 		dL_dcolor, dL_dflows), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance

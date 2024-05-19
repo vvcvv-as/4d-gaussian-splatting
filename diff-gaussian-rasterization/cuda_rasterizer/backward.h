@@ -16,6 +16,7 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
+#define EPI 0.001f
 #include <glm/glm.hpp>
 
 namespace BACKWARD
@@ -25,9 +26,12 @@ namespace BACKWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		const float alpha_thres,
+		const int bounding_mode,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
+		const float2* sigmoid_thres_temp,
 		const float* colors,
 		const float* depths,
 		const float* flows_2d,
@@ -40,6 +44,8 @@ namespace BACKWARD
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
+		float* dL_sigmoid_thres,
+		float* dL_sigmoid_temp,
 		float* dL_dcolors,
 		float* dL_dflows);
 

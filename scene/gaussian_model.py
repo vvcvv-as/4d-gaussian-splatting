@@ -69,6 +69,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._sigmoid_thres = torch.empty(0)
+        self._sigmoid_temp = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -103,6 +105,8 @@ class GaussianModel:
                 self._scaling,
                 self._rotation,
                 self._opacity,
+                self._sigmoid_thres,
+                self._sigmoid_temp,
                 self.max_radii2D,
                 self.xyz_gradient_accum,
                 self.denom,
@@ -118,6 +122,8 @@ class GaussianModel:
                 self._scaling,
                 self._rotation,
                 self._opacity,
+                self._sigmoid_thres,
+                self._sigmoid_temp,
                 self.max_radii2D,
                 self.xyz_gradient_accum,
                 self.t_gradient_accum,
@@ -141,6 +147,8 @@ class GaussianModel:
             self._scaling, 
             self._rotation, 
             self._opacity,
+            self._sigmoid_thres,
+            self._sigmoid_temp,
             self.max_radii2D, 
             xyz_gradient_accum, 
             denom,
@@ -154,6 +162,8 @@ class GaussianModel:
             self._scaling, 
             self._rotation, 
             self._opacity,
+            self._sigmoid_thres,
+            self._sigmoid_temp,
             self.max_radii2D, 
             xyz_gradient_accum, 
             t_gradient_accum,
@@ -214,6 +224,14 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_sigmoid_thres(self):
+        return self._sigmoid_thres
+    
+    @property
+    def get_sigmoid_temp(self):
+        return self._sigmoid_temp
     
     @property
     def get_max_sh_channels(self):
@@ -251,7 +269,7 @@ class GaussianModel:
         elif self.max_sh_degree_t and self.active_sh_degree_t < self.max_sh_degree_t:
             self.active_sh_degree_t += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, args):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -279,6 +297,11 @@ class GaussianModel:
                 rots_r[:, 0] = 1
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        sigmoid_thres = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        sigmoid_temp = torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda") 
+
+        sigmoid_thres.data.fill_(float(args.init_thres))
+        sigmoid_temp.data.fill_(float(args.init_temp))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -286,6 +309,8 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._sigmoid_temp = nn.Parameter(sigmoid_temp.requires_grad_(True))
+        self._sigmoid_thres = nn.Parameter(sigmoid_thres.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
         if self.gaussian_dim == 4:
@@ -317,33 +342,59 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._sigmoid_temp = nn.Parameter(sigmoid_temp.requires_grad_(True))
+        self._sigmoid_thres = nn.Parameter(sigmoid_thres.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
         self._t = nn.Parameter(fused_times.requires_grad_(True))
         self._scaling_t = nn.Parameter(scales_t.requires_grad_(True))
         self._rotation_r = nn.Parameter(rots_r.requires_grad_(True))
 
-    def training_setup(self, training_args):
+    def training_setup(self, training_args, args = None):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
-        ]
-        if self.gaussian_dim == 4: # TODO: tune time_lr_scale
-            if training_args.position_t_lr_init < 0:
-                training_args.position_t_lr_init = training_args.position_lr_init
-            self.t_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-            l.append({'params': [self._t], 'lr': training_args.position_t_lr_init * self.spatial_lr_scale, "name": "t"})
-            l.append({'params': [self._scaling_t], 'lr': training_args.scaling_lr, "name": "scaling_t"})
-            if self.rot_4d:
-                l.append({'params': [self._rotation_r], 'lr': training_args.rotation_lr, "name": "rotation_r"})
+        if (args is None) or (not args.fix_non_thres):
+            l = [
+                {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+                {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._sigmoid_thres], 'lr': training_args.sigmoid_thres_lr, "name": "sigmoid_thres"},
+                {'params': [self._sigmoid_temp], 'lr': training_args.sigmoid_temp_lr, "name": "sigmoid_temp"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            ]
+            if self.gaussian_dim == 4: # TODO: tune time_lr_scale
+                if training_args.position_t_lr_init < 0:
+                    training_args.position_t_lr_init = training_args.position_lr_init
+                self.t_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+                l.append({'params': [self._t], 'lr': training_args.position_t_lr_init * self.spatial_lr_scale, "name": "t"})
+                l.append({'params': [self._scaling_t], 'lr': training_args.scaling_lr, "name": "scaling_t"})
+                if self.rot_4d:
+                    l.append({'params': [self._rotation_r], 'lr': training_args.rotation_lr, "name": "rotation_r"})
+        elif args.fix_non_thres:
+            print("Fixing non-threshold parameters!")
+            #print(training_args.sigmoid_thres_lr)
+            l = [
+                {'params': [self._xyz], 'lr': 0., "name": "xyz"},
+                {'params': [self._features_dc], 'lr': 0., "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': 0., "name": "f_rest"},
+                {'params': [self._opacity], 'lr': 0., "name": "opacity"},
+                {'params': [self._sigmoid_thres], 'lr': training_args.sigmoid_thres_lr, "name": "sigmoid_thres"},
+                {'params': [self._sigmoid_temp], 'lr': 0., "name": "sigmoid_temp"},
+                {'params': [self._scaling], 'lr': 0., "name": "scaling"},
+                {'params': [self._rotation], 'lr': 0., "name": "rotation"}
+            ]
+            if self.gaussian_dim == 4: # TODO: tune time_lr_scale
+                if training_args.position_t_lr_init < 0:
+                    training_args.position_t_lr_init = training_args.position_lr_init
+                self.t_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+                l.append({'params': [self._t], 'lr': 0., "name": "t"})
+                l.append({'params': [self._scaling_t], 'lr': 0., "name": "scaling_t"})
+                if self.rot_4d:
+                    l.append({'params': [self._rotation_r], 'lr': 0., "name": "rotation_r"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -409,6 +460,8 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
+        self._sigmoid_temp = optimizable_tensors["sigmoid_temp"]
+        self._sigmoid_thres = optimizable_tensors["sigmoid_thres"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -446,11 +499,13 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_sigmoid_temp, new_sigmoid_thres, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
+        "sigmoid_temp" : new_sigmoid_temp,
+        "sigmoid_thres" : new_sigmoid_thres,
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         }
@@ -465,6 +520,8 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
+        self._sigmoid_temp = optimizable_tensors["sigmoid_temp"]
+        self._sigmoid_thres = optimizable_tensors["sigmoid_thres"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         if self.gaussian_dim == 4:
@@ -493,6 +550,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_sigmoid_temp = self._sigmoid_temp[selected_pts_mask].repeat(N,1)
+        new_sigmoid_thres = self._sigmoid_thres[selected_pts_mask].repeat(N,1)
         
         if not self.rot_4d:
             stds = self.get_scaling[selected_pts_mask].repeat(N,1)
@@ -520,7 +579,7 @@ class GaussianModel:
             new_scaling_t = self.scaling_inverse_activation(self.get_scaling_t[selected_pts_mask].repeat(N,1) / (0.8*N))
             new_rotation_r = self._rotation_r[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity,new_sigmoid_temp, new_sigmoid_thres, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -536,6 +595,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
+        new_sigmoid_temp = self._sigmoid_temp[selected_pts_mask]
+        new_sigmoid_thres = self._sigmoid_thres[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_t = None
@@ -547,7 +608,7 @@ class GaussianModel:
             if self.rot_4d:
                 new_rotation_r = self._rotation_r[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_sigmoid_temp, new_sigmoid_thres, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_grad_t=None, prune_only=False):
         if not prune_only:

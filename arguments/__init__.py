@@ -47,6 +47,12 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
+        self.rect_factor = 3.0
+        self.init_thres = -100.
+        self.init_thres_weight_opacity=False
+        self.init_temp = 1.
+        self.alpha_thres = 1./255.
+        self.bounding_mode = 0
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
@@ -87,6 +93,8 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
+        self.sigmoid_thres_lr = 0.
+        self.sigmoid_temp_lr = 0.
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01

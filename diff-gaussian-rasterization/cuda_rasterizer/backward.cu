@@ -871,9 +871,12 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	const float alpha_thres,
+	const int bounding_mode,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
+	const float2* __restrict__ sigmoid_thres_temp,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
 	const float* __restrict__ flows_2d,
@@ -886,6 +889,8 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_sigmoid_thres,
+	float* __restrict__ dL_sigmoid_temp,
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ dL_dflows)
 {
@@ -909,6 +914,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float2 collected_sigmoid_thres_temp[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
 	__shared__ float collected_flows[2*BLOCK_SIZE];
@@ -966,6 +972,7 @@ renderCUDA(
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_depths[block.thread_rank()] = depths[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_sigmoid_thres_temp[block.thread_rank()] = sigmoid_thres_temp[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 			for (int i = 0; i < 2; i++)
@@ -986,13 +993,29 @@ renderCUDA(
 			const float2 xy = collected_xy[j];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_o = collected_conic_opacity[j];
+			float2 stt = collected_sigmoid_thres_temp[j];
+			float power_thres = stt.x;
+			float power_temp = stt.y;
 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
 			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
-			if (alpha < 1.0f / 255.0f)
+			float alpha;
+			float sigmoid_power;
+			if (bounding_mode == 3){
+				if(power < power_thres || power > 0.0f)
+					continue;
+				alpha = min(0.99f, con_o.w * exp(power));
+			}
+			else{
+				if (power > 0.0f)
+					continue;
+				sigmoid_power = 1.f / (1.f + expf((-power+power_thres)/power_temp));
+				alpha = min(0.99f, con_o.w * exp(power) * sigmoid_power);
+			}
+			// const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < alpha_thres)
 				continue;
 
 			T = T / (1.f - alpha);
@@ -1055,25 +1078,51 @@ renderCUDA(
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			if(bounding_mode!=3){
+				// Helpful reusable temporary variables
+				const float dL_dG = con_o.w * sigmoid_power * dL_dalpha;
+				const float dL_dsigmoid_power = con_o.w * G * dL_dalpha;
+				const float dsigmoid_helper = sigmoid_power * (1 - sigmoid_power) / (power_temp+EPI) * dL_dsigmoid_power;
+				const float dL_dpower = dL_dG * G + dsigmoid_helper;
+				const float dpower_ddelx = -con_o.x * d.x - con_o.y * d.y;
+				const float dpower_ddely = -con_o.y * d.x - con_o.z * d.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
-			atomicAdd(&dL_dmean2D[global_id].z, dL_depth * dchannel_dcolor);
+				// Update gradients w.r.t. 2D mean position of the Gaussian
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dpower * dpower_ddelx * ddelx_dx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dpower * dpower_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+				// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				atomicAdd(&dL_dconic2D[global_id].x, -0.5f * d.x * d.x * dL_dpower);
+				atomicAdd(&dL_dconic2D[global_id].y, -0.5f * d.x * d.y * dL_dpower);
+				atomicAdd(&dL_dconic2D[global_id].w, -0.5f * d.y * d.y * dL_dpower);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				// Update gradients w.r.t. opacity of the Gaussian
+				atomicAdd(&(dL_dopacity[global_id]), G * sigmoid_power * dL_dalpha);
+
+				// Update gradients w.r.t. sigmoid parameters
+				atomicAdd(&(dL_sigmoid_temp[global_id]), - dsigmoid_helper * (power - power_thres) / (power_temp+EPI));
+				atomicAdd(&(dL_sigmoid_thres[global_id]), - dsigmoid_helper);
+			}
+			else{
+				// Helpful reusable temporary variables
+				const float dL_dG = con_o.w * dL_dalpha;
+				const float gdx = G * d.x;
+				const float gdy = G * d.y;
+				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+				// Update gradients w.r.t. 2D mean position of the Gaussian
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+
+				// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+
+				// Update gradients w.r.t. opacity of the Gaussian
+				atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			}
 		}
 	}
 }
@@ -1173,9 +1222,12 @@ void BACKWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	const float alpha_thres,
+	const int bounding_mode,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
+	const float2* sigmoid_thres_temp,
 	const float* colors,
 	const float* depths,
 	const float* flows_2d,
@@ -1188,6 +1240,8 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
+	float* dL_sigmoid_thres,
+	float* dL_sigmoid_temp,
 	float* dL_dcolors,
 	float* dL_dflows)
 {
@@ -1195,9 +1249,12 @@ void BACKWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		alpha_thres,
+		bounding_mode,
 		bg_color,
 		means2D,
 		conic_opacity,
+		sigmoid_thres_temp,
 		colors,
 		depths,
 		flows_2d,
@@ -1210,6 +1267,8 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
+		dL_sigmoid_thres,
+		dL_sigmoid_temp,
 		dL_dcolors,
 		dL_dflows
 		);

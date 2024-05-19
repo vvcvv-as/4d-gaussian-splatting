@@ -22,6 +22,8 @@ RasterizeGaussiansCUDA(
     const torch::Tensor& colors,
 	const torch::Tensor& flows,
     const torch::Tensor& opacity,
+	const torch::Tensor& sigmoid_thres,
+	const torch::Tensor& sigmoid_temp,
 	const torch::Tensor& ts,
 	const torch::Tensor& scales,
 	const torch::Tensor& scales_t,
@@ -45,9 +47,12 @@ RasterizeGaussiansCUDA(
 	const int gaussian_dim,
 	const bool force_sh_3d,
 	const bool prefiltered,
+	const float rect_factor,
+    const float alpha_thres,
+	const int bounding_mode,
 	const bool debug);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -83,6 +88,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
+	const float alpha_thres,
+	const int bounding_mode,
 	const bool debug);
 		
 torch::Tensor markVisible(

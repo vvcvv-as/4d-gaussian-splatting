@@ -16,7 +16,8 @@ from .diff_gaussian_rasterization import GaussianRasterizationSettings, Gaussian
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh, eval_shfs_4d
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, rect_factor=3.0, alpha_thres=1./255., bounding_mode=0,
+           sigmoid_thres=None, sigmoid_temp=None):
     """
     Render the scene. 
     
@@ -52,6 +53,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         gaussian_dim=pc.gaussian_dim,
         force_sh_3d=pc.force_sh_3d,
         prefiltered=False,
+        rect_factor=rect_factor,
+        alpha_thres=alpha_thres,
+        bounding_mode=bounding_mode,
         debug=pipe.debug
     )
 
@@ -60,6 +64,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    if sigmoid_thres is None:
+        sigmoid_thres = pc.get_sigmoid_thres
+    if sigmoid_temp is None:
+        sigmoid_temp = pc.get_sigmoid_temp
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -131,6 +139,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             colors_precomp = colors_precomp[mask]
         if opacity is not None:
             opacity = opacity[mask]
+        if sigmoid_thres is None:
+            sigmoid_thres = sigmoid_thres[mask]
+        if sigmoid_temp is None:
+            sigmoid_temp = sigmoid_temp[mask]
         if scales is not None:
             scales = scales[mask]
         if scales_t is not None:
@@ -152,6 +164,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = colors_precomp,
         flow_2d = flow_2d,
         opacities = opacity,
+        sigmoid_thres = sigmoid_thres,
+        sigmoid_temp = sigmoid_temp,
         ts = ts,
         scales = scales,
         scales_t = scales_t,

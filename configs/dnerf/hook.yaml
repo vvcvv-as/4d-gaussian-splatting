@@ -9,7 +9,9 @@ exhaust_test: True
 
 ModelParams:
   sh_degree: 3
-  source_path: "data/dnerf/hook"
+  init_thres: -4.159
+  init_temp: 0.01
+  source_path: "/data/chenxi/dnerf/hook"
   model_path: "output/dnerf/hook"
   images: "images"
   resolution: 2
@@ -40,6 +42,8 @@ OptimizationParams:
   position_lr_max_steps: 30_000
   feature_lr: 0.0025
   opacity_lr: 0.05
+  sigmoid_thres_lr : 0.01
+  sigmoid_temp_lr : 0.01
   scaling_lr: 0.005
   rotation_lr: 0.001
   percent_dense: 0.01

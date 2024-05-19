@@ -40,6 +40,8 @@ namespace CudaRasterizer
 			const float* colors_precomp,
 			const float* flows_precomp,
 			const float* opacities,
+			const float* sigmoid_thres,
+			const float* sigmoid_temp,
 			const float* ts,
 			const float* scales,
 			const float* scales_t,
@@ -55,6 +57,9 @@ namespace CudaRasterizer
 			const bool rot_4d, const int gaussian_dim, const bool force_sh_3d,
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
+			const float rect_factor,
+            const float alpha_thres,
+			const int bounding_mode,
 			float* out_color,
 			float* out_flow,
 			float* out_depth,
@@ -96,6 +101,8 @@ namespace CudaRasterizer
 			float* dL_dmean2D,
 			float* dL_dconic,
 			float* dL_dopacity,
+			float* dL_sigmoid_thres,
+			float* dL_sigmoid_temp,
 			float* dL_dcolor,
 			float* dL_dmean3D,
 			float* dL_dcov3D,
@@ -106,6 +113,8 @@ namespace CudaRasterizer
 			float* dL_dscale_t,
 			float* dL_drot,
 			float* dL_drot_r,
+			const float alpha_thres,
+			const int bounding_mode,
 			bool debug);
 	};
 };

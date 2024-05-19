@@ -38,6 +38,8 @@ def rasterize_gaussians(
     colors_precomp,
     flow_2d,
     opacities,
+    sigmoid_thres,
+    sigmoid_temp,
     ts,
     scales,
     scales_t,
@@ -53,6 +55,8 @@ def rasterize_gaussians(
         colors_precomp,
         flow_2d,
         opacities,
+        sigmoid_thres,
+        sigmoid_temp,
         ts,
         scales,
         scales_t,
@@ -72,6 +76,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         colors_precomp,
         flow_2d,
         opacities,
+        sigmoid_thres,
+        sigmoid_temp,
         ts,
         scales,
         scales_t,
@@ -88,6 +94,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             colors_precomp,
             flow_2d,
             opacities,
+            sigmoid_thres,
+            sigmoid_temp,
             ts,
             scales,
             scales_t,
@@ -111,6 +119,9 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.gaussian_dim,
             raster_settings.force_sh_3d,
             raster_settings.prefiltered,
+            raster_settings.rect_factor,
+            raster_settings.alpha_thres,
+            raster_settings.bounding_mode,
             raster_settings.debug,
         )
 
@@ -179,13 +190,16 @@ class _RasterizeGaussians(torch.autograd.Function):
                 num_rendered,
                 binningBuffer,
                 imgBuffer,
+                raster_settings.alpha_thres,
+                raster_settings.bounding_mode,
                 raster_settings.debug)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                (grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, 
+                (grad_means2D, grad_colors_precomp, grad_opacities,grad_sigmoid_thres, grad_sigmoid_temp,
+                  grad_means3D, grad_cov3Ds_precomp, grad_sh, 
                 grad_flows, grad_ts, grad_scales, grad_scales_t, 
                 grad_rotations, grad_rotations_r) = _C.rasterize_gaussians_backward(*args)
             except Exception as ex:
@@ -193,7 +207,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-             (grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, 
+             (grad_means2D, grad_colors_precomp, grad_opacities, grad_sigmoid_thres, grad_sigmoid_temp,
+                grad_means3D, grad_cov3Ds_precomp, grad_sh, 
                 grad_flows, grad_ts, grad_scales, grad_scales_t, 
                 grad_rotations, grad_rotations_r) = _C.rasterize_gaussians_backward(*args)
 
@@ -204,6 +219,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_colors_precomp,
             grad_flows,
             grad_opacities,
+            None,
+            None,
             grad_ts,
             grad_scales,
             grad_scales_t,
@@ -233,6 +250,9 @@ class GaussianRasterizationSettings(NamedTuple):
     gaussian_dim: int
     force_sh_3d: bool
     prefiltered : bool
+    rect_factor: float
+    alpha_thres: float
+    bounding_mode: int
     debug : bool
 
 class GaussianRasterizer(nn.Module):
@@ -251,7 +271,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, flow_2d = None, ts=None,
+    def forward(self, means3D, means2D, opacities,sigmoid_thres, sigmoid_temp, shs = None, colors_precomp = None, flow_2d = None, ts=None,
                 scales = None, scales_t=None, 
                 rotations = None, rotations_r=None, 
                 cov3D_precomp = None):
@@ -297,6 +317,8 @@ class GaussianRasterizer(nn.Module):
             colors_precomp,
             flow_2d,
             opacities,
+            sigmoid_thres,
+            sigmoid_temp,
             ts,
             scales,
             scales_t,

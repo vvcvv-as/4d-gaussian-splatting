@@ -34,7 +34,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
+def training(dataset, opt, pipe, args, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
     if dataset.frame_ratio > 1:
@@ -44,7 +44,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, gaussian_dim=gaussian_dim, time_duration=time_duration, rot_4d=rot_4d, force_sh_3d=force_sh_3d, sh_degree_t=2 if pipe.eval_shfs_4d else 0)
     scene = Scene(dataset, gaussians, num_pts=num_pts, num_pts_ratio=num_pts_ratio, time_duration=time_duration)
-    gaussians.training_setup(opt)
+    gaussians.training_setup(opt, args)
+    if args.ply_file:
+        gaussians.load_ply(args.ply_file, args)
+        gaussians.training_setup(opt, args)
+    if args.ply_iter:
+        first_iter = args.ply_iter
     
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -84,7 +89,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             iteration += 1
             if iteration > opt.iterations:
                 break
-
+            if args.reduce_temp_simple:  
+                if iteration < args.reduce_iter:
+                    if iteration % 100 == 0 and args.reduce_temp_simple:
+                        # for 30000 iterations, reduced to 0.04904 of the original temperature
+                        gaussians._sigmoid_temp.data = gaussians._sigmoid_temp.data * 0.99
+                else:
+                    dataset.bounding_mode = 3
+            progress_bar.set_postfix({"Thres": f"{gaussians._sigmoid_thres.data[0].item():.{5}f}"}) 
             iter_start.record()
             gaussians.update_learning_rate(iteration)
             
@@ -363,6 +375,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--start_checkpoint", type=str, default = None)
+
+    parser.add_argument("--reduce_temp_simple", action="store_true", default=False)
+    parser.add_argument("--reduce_iter", type=int, default=30_000)
+
+    parser.add_argument("--ply_file", type=str, default=None)
+    parser.add_argument("--ply_iter", type=int, default=None)
+    parser.add_argument("--fix_non_thres", action="store_true", default=True)
     
     parser.add_argument("--gaussian_dim", type=int, default=3)
     parser.add_argument("--time_duration", nargs=2, type=float, default=[-0.5, 0.5])
@@ -376,8 +395,10 @@ if __name__ == "__main__":
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    print(args.fix_non_thres)
         
     cfg = OmegaConf.load(args.config)
+    #print(cfg)
     def recursive_merge(key, host):
         if isinstance(host[key], DictConfig):
             for key1 in host[key].keys():
@@ -399,7 +420,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.start_checkpoint, args.debug_from,
+    training(lp.extract(args), op.extract(args), pp.extract(args),args, args.test_iterations, args.save_iterations, args.start_checkpoint, args.debug_from,
              args.gaussian_dim, args.time_duration, args.num_pts, args.num_pts_ratio, args.rot_4d, args.force_sh_3d, args.batch_size)
 
     # All done

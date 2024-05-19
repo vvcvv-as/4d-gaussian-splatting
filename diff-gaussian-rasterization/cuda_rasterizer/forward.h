@@ -30,6 +30,8 @@ namespace FORWARD
 		const glm::vec4* rotations,
 		const glm::vec4* rotations_r,
 		const float* opacities,
+		const float* sigmoid_thres,
+		const float* sigmoid_temp,
 		const float* shs,
 		bool* clamped,
 		const float* cov3D_precomp,
@@ -49,9 +51,13 @@ namespace FORWARD
 		float* cov3Ds,
 		float* colors,
 		float4* conic_opacity,
+		float2* sigmoid_thres_temp,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+        const float rect_factor,
+		const float alpha_thres,
+		const int bounding_mode);
 
 	// Main rasterization method.
 	void render(
@@ -59,11 +65,14 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		const float alpha_thres,
+		const int bounding_mode,
 		const float2* points_xy_image,
 		const float* features,
 		const float* flows,
 		const float* depths,
 		const float4* conic_opacity,
+		const float2* sigmoid_thres_temp,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,

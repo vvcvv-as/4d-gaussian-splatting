@@ -348,6 +348,8 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	const glm::vec4* rotations,
 	const glm::vec4* rotations_r,
 	const float* opacities,
+	const float* sigmoid_thres,
+	const float* sigmoid_temp,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -367,9 +369,13 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
+	float2* sigmoid_thres_temp,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const float rect_factor,
+	const float alpha_thres,
+	const int bounding_mode)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -384,6 +390,7 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	// float3 p_view;
 	// if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 	// 	return;
+	
 
 	// Transform point by projecting
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
@@ -421,7 +428,10 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	float3 p_view;
 	if (!in_frustum(p_orig, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
-
+	// Perform early thres-based culling
+	float thres = sigmoid_thres[idx];
+	if (bounding_mode ==3 and thres >= 0)
+		return;
 	// Transform point by projecting
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
@@ -444,7 +454,26 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	float my_radius;
+	switch (bounding_mode) {
+		case 0:
+			// float my_radius = ceil(rect_factor * sqrt(max(lambda1, lambda2)));
+			my_radius = ceil(rect_factor * sqrt(max(lambda1, lambda2)));
+			break;
+		case 1:
+			my_radius = ceil(sqrt(2 * log(255) / log(2.7182818284f) * max(lambda1, lambda2)));
+			break;
+		case 2:
+			if (alpha_thres >= opacities[idx])
+				return;
+			my_radius = ceil(sqrt(2 * log(1.f/alpha_thres * opacities[idx]) / log(2.7182818284f) * max(lambda1, lambda2)));
+			// my_radius = 1;
+			// because opacity lower than alpha_thres, there is no fragment to render
+			break;
+		case 3:
+			my_radius = ceil(min(rect_factor, sqrt(- 2 * thres)) * sqrt(max(lambda1, lambda2)));
+			break;
+	}
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
@@ -472,6 +501,7 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity };
+	sigmoid_thres_temp[idx] = { thres, sigmoid_temp[idx] };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -484,11 +514,14 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	const float alpha_thres,
+	const int bounding_mode,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ flows,
 	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
+	const float2* __restrict__ sigmoid_thres_temp,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -519,6 +552,8 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float2 collected_sigmoid_thres_temp[BLOCK_SIZE];
+
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -544,6 +579,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_sigmoid_thres_temp[block.thread_rank()] = sigmoid_thres_temp[coll_id];
 		}
 		block.sync();
 
@@ -558,15 +594,29 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
+			float2 stt = collected_sigmoid_thres_temp[j];
+			float power_thres = stt.x;
+			float temperature = stt.y;
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
+			float alpha;
+			if (bounding_mode == 3){
+				if(power < power_thres || power > 0.0f)
+					continue;
+				alpha = min(0.99f, con_o.w * exp(power));
+			}
+			else{
+				if (power > 0.0f)
+					continue;
+				float sigmoid_power = 1.f / (1.f + expf((-power+power_thres)/temperature));
+				alpha = min(0.99f, con_o.w * exp(power) * sigmoid_power);
+			}
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < alpha_thres)
+				continue;
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
@@ -610,11 +660,14 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	float alpha_thres,
+	const int bounding_mode,
 	const float2* means2D,
 	const float* colors,
 	const float* flows,
 	const float* depths,
 	const float4* conic_opacity,
+	const float2* sigmoid_thres_temp,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -626,11 +679,14 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		alpha_thres,
+		bounding_mode,
 		means2D,
 		colors,
 		flows,
 		depths,
 		conic_opacity,
+		sigmoid_thres_temp,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -648,6 +704,8 @@ void FORWARD::preprocess(int P, int D, int D_t, int M,
 	const glm::vec4* rotations,
 	const glm::vec4* rotations_r,
 	const float* opacities,
+	const float* sigmoid_thres,
+	const float* sigmoid_temp,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -667,9 +725,13 @@ void FORWARD::preprocess(int P, int D, int D_t, int M,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
+	float2* sigmoid_thres_temp,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+    const float rect_factor,
+	const float alpha_thres,
+	const int bounding_mode)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, D_t, M,
@@ -681,6 +743,8 @@ void FORWARD::preprocess(int P, int D, int D_t, int M,
 		rotations,
 		rotations_r,
 		opacities,
+		sigmoid_thres,
+		sigmoid_temp,
 		shs,
 		clamped,
 		cov3D_precomp,
@@ -700,8 +764,12 @@ void FORWARD::preprocess(int P, int D, int D_t, int M,
 		cov3Ds,
 		rgb,
 		conic_opacity,
+		sigmoid_thres_temp,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		rect_factor,
+		alpha_thres,
+		bounding_mode
 		);
 }
